@@ -1,84 +1,99 @@
 """
-app.py — веб-интерфейс на Streamlit.
+fake_llm.py — детерминированный офлайн-бэкенд LLM. Готов, менять не нужно.
 
-ПРАКТИКА 6. Что делает студент:
-  1. довести оформление диалога под свой домен (заголовок, подсказки, приветствие)
-  2. проверить, что кнопка очистки действительно сбрасывает и историю, и автомат
+Третий бэкенд помимо GigaChat и Ollama: не ходит в сеть, не требует ключей
+и не использует общих знаний. Ответ собирается только из фрагментов, которые
+нашёл поиск и сложил build_messages() из prompts.py. Включается строкой
+LLM_BACKEND=fake в .env.
 
-Готово: изолированные сессии, вызов ядра, отрисовка истории, плашка
-офлайн-заглушки LLM.
+Зачем он есть. Учебные квоты кончаются, сеть в аудитории падает, Ollama
+установлена не у всех — а работа должна продолжаться. Заглушка поднимает
+систему целиком без единого ключа: проверка автомата ролей (П3), рубежный
+контроль с чистого клона (П5), отладка интерфейса и guardrails (П6–П7).
 
-Критерии приёмки:
-  - интерфейс принимает ввод и показывает историю диалога
-  - кнопка очистки сбрасывает сессию: после неё система не помнит прошлых реплик
-  - две вкладки браузера — две независимые сессии
+Экстракция здесь принципиальна. Заглушка не выдумывает ни слова, поэтому
+проверка «подмена исходных данных меняет ответ» (П4, §3.7) на ней работает
+по-настоящему: убрали документ из корпуса, переиндексировали — ответ изменился.
 
-Про безопасность (П7). Проверки ввода здесь нет намеренно: guardrail живёт в ядре
-и одинаково защищает и этот интерфейс, и VK-бота. Не переносите его сюда — иначе
-вторым каналом защиту можно будет обойти.
+Чего заглушка НЕ делает:
+  - не имитирует качество ответа. Судья на П6 получит выписку из фрагмента,
+    а не работу модели, поэтому мерить на ней Faithfulness бессмысленно;
+  - не годится для П8: расход токенов ненастоящий, TCO считать не по чему;
+  - не заменяет П4: GigaChatClient и OllamaClient студент пишет сам,
+    они входят в критерии приёмки.
 
-Запуск:
-    streamlit run app.py
+Работа, сданная на LLM_BACKEND=fake, не принимается.
 """
 
-import uuid
+import logging
+import re
 
-import streamlit as st
+log = logging.getLogger(__name__)
 
-import config
-from orchestrator import Orchestrator
+# Разметка фрагмента, которую печатает format_chunks() в prompts.py:
+#     [источник, стр. 12] (близость 0.83)      — когда у документа есть страницы
+#     [источник] (близость 0.83)               — когда их нет (markdown, txt)
+#     текст фрагмента
+# ЗАВИСИМОСТЬ: если формат в format_chunks() изменится или build_messages()
+# соберёт контекст своим кодом в обход format_chunks(), регулярка перестанет
+# находить фрагменты. Молча это не пройдёт — см. _NO_FORMAT ниже.
+# Хвост «\n\nВопрос:» в границе нужен для случая единственного фрагмента:
+# без него в ответ утаскивается сам вопрос, стоящий следом за блоком.
+_FRAGMENT_RE = re.compile(
+    r"\[(?P<source>[^,\]]+)(?:,\s*стр\.\s*(?P<page>\d+))?\][^\n]*\n(?P<text>.*?)"
+    r"(?=\n\n\[|\n\nВопрос:|\Z)",
+    re.DOTALL,
+)
 
-st.set_page_config(page_title="Справочный ассистент", page_icon="🔎")
+# Что печатает format_chunks(), когда поиск не вернул ничего
+_EMPTY_SEARCH = "(база знаний ничего не вернула)"
+
+# Вопрос без контекста короче этого; всё, что длиннее, — вопрос плюс фрагменты
+_CONTEXT_THRESHOLD = 400
+
+_NOT_FOUND = "В базе знаний нет ответа на этот вопрос."
+
+_NO_FORMAT = (
+    "Офлайн-заглушка не нашла в промпте фрагментов формата [источник, стр. N]. "
+    "Похоже, контекст в промпт попал, но собран в обход format_chunks() из "
+    "prompts.py — проверьте build_messages(). Поиск и индекс здесь ни при чём."
+)
+
+_WARNING = (
+    "ВНИМАНИЕ: включена офлайн-заглушка LLM (LLM_BACKEND=fake).\n"
+    "Ответы собраны из найденных фрагментов, модель не вызывается — "
+    "осмысленный вид ответа ничего не говорит о качестве системы.\n"
+    "Для сдачи практик 4, 6 и 8 нужен реальный бэкенд: gigachat или ollama."
+)
 
 
-@st.cache_resource
-def get_orchestrator() -> Orchestrator:
-    """Одно ядро на всё приложение: MCP-сессия и модель поднимаются один раз."""
-    return Orchestrator()
+class FakeClient:
+    """Заглушка LLM: пересказывает первый найденный фрагмент из messages."""
 
+    def __init__(self):
+        log.warning(_WARNING)
 
-# Изолированная сессия на вкладку браузера
-if "session_id" not in st.session_state:
-    st.session_state.session_id = f"web:{uuid.uuid4()}"
-if "history" not in st.session_state:
-    st.session_state.history = []
+    def generate(self, messages: list[dict], temperature: float = 0.3) -> str:
+        user_content = ""
+        for message in reversed(messages):
+            if message.get("role") == "user":
+                user_content = message.get("content", "")
+                break
 
-orchestrator = get_orchestrator()
+        match = _FRAGMENT_RE.search(user_content)
+        if not match:
+            # Два разных случая под одним симптомом: поиск честно ничего
+            # не нашёл — или нашёл, но разметка не та, которую разбирает
+            # регулярка. Второй случай легко принять за поломку индекса,
+            # поэтому он назван вслух.
+            if (_EMPTY_SEARCH not in user_content
+                    and len(user_content) > _CONTEXT_THRESHOLD):
+                return _NO_FORMAT
+            return _NOT_FOUND
 
-# TODO (П6): замените заголовок и подсказку на свои
-st.title("Справочный ассистент")
-st.caption("Отвечает по загруженной базе знаний и ссылается на источники.")
+        text = " ".join(match.group("text").split())[:600]
+        source = match.group("source").strip()
+        return f"По найденным фрагментам: {text} (источник: {source})"
 
-# Готовая часть, не убирать: на офлайн-заглушке ответы выглядят осмысленно,
-# и без плашки это легко принять за работающую систему — в том числе на защите.
-if config.LLM_BACKEND == "fake":
-    st.warning(
-        "Работает офлайн-заглушка LLM (`LLM_BACKEND=fake`): ответы собраны "
-        "из найденных фрагментов, модель не вызывается. Для сдачи практик "
-        "4, 6 и 8 переключитесь на `gigachat` или `ollama`."
-    )
-
-with st.sidebar:
-    st.subheader("Сессия")
-    st.code(st.session_state.session_id, language=None)
-    if st.button("Очистить сессию", use_container_width=True):
-        orchestrator.reset(st.session_state.session_id)
-        st.session_state.history = []
-        st.session_state.session_id = f"web:{uuid.uuid4()}"
-        st.rerun()
-
-for role, content in st.session_state.history:
-    with st.chat_message(role):
-        st.markdown(content)
-
-if question := st.chat_input("Задайте вопрос по базе знаний"):
-    st.session_state.history.append(("user", question))
-    with st.chat_message("user"):
-        st.markdown(question)
-
-    with st.chat_message("assistant"):
-        with st.spinner("Ищу в базе знаний…"):
-            answer = orchestrator.handle(st.session_state.session_id, question)
-        st.markdown(answer)
-
-    st.session_state.history.append(("assistant", answer))
+    def count_tokens(self, text: str) -> int:
+        return max(1, len(text) // 3)

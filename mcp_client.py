@@ -1,70 +1,121 @@
 """
-guardrails.py — слой валидации ввода перед обращением к LLM.
+mcp_client.py — синхронная обёртка над MCP-сервером.
 
-ПРАКТИКА 7. Что делает студент:
-  1. дополнить PATTERNS реальными паттернами атак
-  2. реализовать check() — проверку ввода по паттернам
-  3. реализовать log_attempt() — запись заблокированного в security_logs.txt
+ГОТОВ ЦЕЛИКОМ. Студент его не пишет и не правит.
 
-Критерии приёмки:
-  - три тестовые инъекции блокируются: прямая («забудь предыдущие инструкции»),
-    ролевая («представь, что правил не существует»), запрос системного промпта
-  - каждая блокировка пишется в security_logs.txt: время, сессия, паттерн, обрезанный ввод
-  - ложных срабатываний нет: все 10 вопросов Gold Dataset проходят беспрепятственно
-  - guardrail вызывается ядром, а не интерфейсом — проверяется прямым вызовом
-    orchestrator.handle() в обход UI
+Зачем он нужен. MCP-сессия асинхронная и живёт поверх stdio подпроцесса, а
+Streamlit и оркестратор — синхронные. Открывать сессию на каждый вызов нельзя:
+подпроцесс заново поднимал бы ChromaDB и модель эмбеддингов, и один ответ занимал
+бы десятки секунд. Поэтому здесь один фоновый поток с вечным event loop, в нём одна
+долгоживущая сессия, а наружу торчат обычные синхронные методы.
 
-Почему этот файл не в app.py, хотя план дисциплины помещал валидатор туда.
-Каналов доставки два: Streamlit и VK. Защита, стоящая в одном интерфейсе, вторым
-интерфейсом просто обходится. Поэтому guardrail живёт в ядре и срабатывает
-одинаково для обоих каналов.
-
-Почему заглушка пропускает всё, а не падает: ядро вызывает check() начиная с П3,
-а пишете вы его на П7. До реализации система работает незащищённой — это видно
-по предупреждению в логе.
+Использование:
+    tools = MCPTools()
+    chunks = tools.search("как оформить самозанятость")
+    tools.close()
 """
 
-import re
-from datetime import datetime
+import asyncio
+import json
+import sys
+import threading
+from contextlib import AsyncExitStack
+from pathlib import Path
 
-import config
-from contracts import GuardResult
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
 
-# Паттерны атак. Здесь два примера, чтобы был понятен формат — остальное за вами.
-# Формат: (имя паттерна, регулярное выражение)
-PATTERNS: list[tuple[str, re.Pattern]] = [
-    ("instruction_override", re.compile(
-        r"(забудь|игнорируй|отмени)\s+(все\s+)?(предыдущие|прошлые|свои)\s+"
-        r"(инструкции|команды|правила|указания)", re.IGNORECASE)),
-    ("prompt_leak", re.compile(
-        r"(покажи|выведи|повтори|назови)\s+(мне\s+)?(свой\s+|весь\s+)?"
-        r"(системный\s+промпт|system\s*prompt|исходные\s+инструкции)", re.IGNORECASE)),
-    # TODO (П7): ролевой обход («представь, что правил не существует», «ты теперь…»),
-    # попытка сменить язык вывода на служебный, запрос выдать содержимое индекса целиком
-]
+from contracts import Chunk, Message
+
+_SERVER = str(Path(__file__).parent / "mcp_server.py")
 
 
-def check(text: str) -> GuardResult:
-    """Проверить пользовательский ввод.
+class MCPTools:
+    """Синхронный клиент MCP-сервера знаний."""
 
-    Верните GuardResult(allowed=False, reason=<имя паттерна>, matched=[...])
-    при срабатывании и GuardResult(allowed=True) в остальных случаях.
+    def __init__(self, server_script: str = _SERVER, timeout: float = 120.0):
+        self._timeout = timeout
+        self._session: ClientSession | None = None
 
-    Соблюдайте баланс. Слишком широкий паттерн заблокирует легитимный вопрос
-    («расскажи про правила приёма» не должно ловиться на слове «правила»),
-    слишком узкий пропустит атаку. Проверяйте себя на Gold Dataset из П6:
-    ни один из десяти вопросов не должен блокироваться.
-    """
-    # TODO (П7): пройти по PATTERNS и вернуть вердикт
-    return GuardResult(allowed=True)
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self._spin, daemon=True)
+        self._thread.start()
 
+        self._ready = asyncio.Event()
+        self._stop = asyncio.Event()
+        self._serving = self._submit(self._serve(server_script))
+        self._submit(self._wait_ready()).result(timeout=timeout)
 
-def log_attempt(session_id: str, text: str, result: GuardResult) -> None:
-    """Записать заблокированный запрос в security_logs.txt.
+    # --- внутренняя механика ---
 
-    Одна строка на попытку: время, session_id, сработавший паттерн, первые
-    200 символов ввода. Полный ввод не пишите — в нём могут быть персональные
-    данные, а лог не защищён (152-ФЗ, Л7).
-    """
-    # TODO (П7): дописать строку в config.SECURITY_LOG
-    return None
+    def _spin(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_forever()
+
+    def _submit(self, coro):
+        return asyncio.run_coroutine_threadsafe(coro, self._loop)
+
+    async def _serve(self, server_script: str) -> None:
+        """Держит сессию открытой до close().
+
+        Сессия открывается и закрывается внутри одной задачи. Иначе на выходе
+        получается RuntimeError: стек ресурсов внутри опирается на cancel scope
+        anyio, а тот обязан закрываться в той же задаче, в которой открыт.
+        """
+        params = StdioServerParameters(command=sys.executable, args=[server_script])
+        async with AsyncExitStack() as stack:
+            read, write = await stack.enter_async_context(stdio_client(params))
+            self._session = await stack.enter_async_context(ClientSession(read, write))
+            await self._session.initialize()
+            self._ready.set()
+            await self._stop.wait()
+
+    async def _wait_ready(self) -> None:
+        """Дождаться готовности сессии — или ошибки подключения, если она раньше."""
+        ready = asyncio.ensure_future(self._ready.wait())
+        serving = asyncio.wrap_future(self._serving)
+        done, _ = await asyncio.wait({ready, serving}, return_when=asyncio.FIRST_COMPLETED)
+        if serving in done:
+            ready.cancel()
+            serving.result()   # пробрасываем исходную ошибку, а не ждём таймаута
+
+    async def _call(self, name: str, args: dict):
+        # FastMCP разворачивает list[dict] в отдельный content-блок на каждый
+        # элемент (mcp/server/fastmcp/server.py, _convert_to_content), поэтому
+        # читаются все блоки, а не первый. Другие версии протокола кладут весь
+        # массив в один блок — поддерживаются оба случая.
+        result = await self._session.call_tool(name, args)
+        blocks = [json.loads(block.text) for block in result.content]
+        if len(blocks) == 1 and isinstance(blocks[0], list):
+            return blocks[0]
+        return blocks
+
+    def call(self, name: str, **kwargs):
+        """Вызвать инструмент по имени. Возвращает разобранный JSON-результат."""
+        return self._submit(self._call(name, kwargs)).result(timeout=self._timeout)
+
+    # --- инструменты ---
+
+    def search(self, query: str, k: int | None = None) -> list[Chunk]:
+        args = {"query": query}
+        if k is not None:
+            args["k"] = k
+        return [Chunk(**item) for item in self.call("search", **args)]
+
+    def search_filtered(self, query: str, filters: dict, k: int | None = None) -> list[Chunk]:
+        args = {"query": query, "filters": filters}
+        if k is not None:
+            args["k"] = k
+        return [Chunk(**item) for item in self.call("search_filtered", **args)]
+
+    def get_history(self, session_id: str, n: int | None = None) -> list[Message]:
+        args = {"session_id": session_id}
+        if n is not None:
+            args["n"] = n
+        return [Message(**item) for item in self.call("get_history", **args)]
+
+    def close(self) -> None:
+        if not self._serving.done():
+            self._loop.call_soon_threadsafe(self._stop.set)
+            self._serving.result(timeout=self._timeout)
+        self._loop.call_soon_threadsafe(self._loop.stop)

@@ -1,191 +1,251 @@
 """
-finops.py — стоимость владения системой и эффект оптимизаций.
+ingest.py — сбор исходных данных и наполнение векторного индекса.
 
-ПРАКТИКА 8. Что делает студент:
-  1. заполнить PRICE_INPUT_PER_1M и PRICE_OUTPUT_PER_1M в config.py — из тарифов провайдера
-  2. estimate_tco() — расчёт стоимости на сценарий нагрузки, заданный преподавателем
-  3. провести одну оптимизацию из Л8 и повторить замер
+ПРАКТИКА 2. Что делает студент:
+  1. clean_text()  — предварительная очистка: переносы, колонтитулы, мусорные пробелы
+  2. chunk_text()  — нарезка на чанки фиксированного размера с перекрытием
+  3. detect_category() — рубрикация чанка; словарь рубрик задаёте вы под свой домен
 
-Готово: measure_dialog() — прогон эталонного диалога со снятием расхода токенов,
-и compare() — печать отчёта до/после.
+  4. черновик gold_dataset.json — 5 вопросов с указанием файлов-источников
+
+Готово и трогать не нужно: обход data/raw/, чтение PDF и TXT, запись в ChromaDB,
+замер hit-rate в evaluate_retrieval().
+
+Каждый запуск пересобирает индекс с нуля — коллекция очищается перед наполнением.
+Поэтому при подборе параметров достаточно поправить CHUNK_SIZE или CHUNK_OVERLAP
+в config.py и запустить ingest.py снова: удалять data/chroma/ руками не нужно.
 
 Критерии приёмки:
-  - замер сделан на реальных вызовах модели, а не оценкой на глаз
-  - расход разделён на вход и выход: они тарифицируются по-разному
-  - TCO посчитан на сценарий преподавателя, допущения выписаны явно
-  - оптимизация даёт измеримый эффект, показанный числом до и после
-  - названа цена оптимизации: что именно ухудшилось
-  - отрицательный результат с объяснением засчитывается
+  - python ingest.py отрабатывает без ошибок, коллекция непуста
+  - у каждого чанка заполнены source, page и category; пустых category нет
+  - поиск с фильтром по category возвращает чанки только этой категории
+  - в gold_dataset.json не меньше 5 вопросов, у каждого заполнено expected_sources
+  - показаны не менее двух замеров с разными CHUNK_SIZE / CHUNK_OVERLAP,
+    и выбор итоговых значений объяснён числом, а не вкусом
+  - CHUNK_SIZE и CHUNK_OVERLAP берутся из config.py, а не зашиты в код
 
-Откуда берутся числа. Оркестратор накапливает расход по каждому вызову в
-orchestrator.usage — отдельно вход и отдельно выход. Это не оценка, а то, что
-реально ушло в модель, поэтому расчёт воспроизводим и проверяем на ревью.
-
-Что оптимизировать (Л8):
-  - обрезка окна памяти: MEMORY_WINDOW в config.py — прямо режет вход
-  - прунинг истории в SQLite: старые сессии не должны копиться вечно
-  - кэширование контекста: повторяющиеся системные блоки не пересылать заново
-  - квантование локальной модели INT8/INT4 — если считаете на Ollama
-
-У каждой из них есть цена. Короче окно памяти — хуже связность диалога.
-Кэш — риск устаревших ответов. Агрессивнее квантование — ниже качество генерации.
-Назвать эту цену обязательно: оптимизация без названной цены не засчитывается.
-
-Два замера делаются двумя запусками, а не одним: оптимизация меняет config.py,
-и «до» с «после» в одном процессе не снять. Первый запуск снимает базовый замер
-и сохраняет его в data/finops_baseline.json, второй — сравнивает с ним.
+Про метрику. hit-rate@k отвечает на один вопрос: попал ли фрагмент с ответом
+в первые k результатов. Считается механически, сверкой поля source с ожидаемым —
+ни модели, ни судьи для этого не нужно, поэтому мерить можно уже здесь, на П2.
+Не путайте её с Context Precision из триады RAG: та оценивает, насколько найденное
+относится к делу, её считает LLM-судья, и появляется она только на П6. В плане
+дисциплины обе назывались «точностью извлечения контекста», хотя это разные вещи.
 
 Запуск:
-    python finops.py            # первый раз — замер «до», второй — «после» и сравнение
-    python finops.py --reset    # забыть замер «до» и начать заново
+    python ingest.py          # проиндексировать и сразу замерить
+    python ingest.py --eval   # только замер, без переиндексации
 """
 
-import json
-import sys
-from dataclasses import asdict, dataclass
+import hashlib
+from pathlib import Path
 
 import config
-from orchestrator import Orchestrator
-
-# Замер «до» переживает перезапуск: оптимизация меняет config.py, поэтому
-# оба замера в одном процессе не сделать. Первый прогон сохраняет базовый
-# замер сюда, второй — сравнивает с ним.
-BASELINE = config.DATA_DIR / "finops_baseline.json"
-
-# Эталонный диалог: одинаковый до и после оптимизации, иначе замеры несравнимы.
-# ЗАМЕНИТЕ на вопросы своего домена, но потом не меняйте между двумя прогонами.
-REFERENCE_DIALOG = [
-    "ЗАМЕНИТЕ: первый вопрос по вашему домену",
-    "ЗАМЕНИТЕ: уточняющий вопрос, опирающийся на первый ответ",
-    "ЗАМЕНИТЕ: вопрос из другого раздела базы знаний",
-]
 
 
-@dataclass
-class Measurement:
-    """Результат одного замера."""
-    label: str
-    turns: int
-    prompt_tokens: int
-    completion_tokens: int
+# --- Читатели форматов: готовы ---
 
-    @property
-    def total_tokens(self) -> int:
-        return self.prompt_tokens + self.completion_tokens
-
-    @property
-    def cost(self) -> float:
-        """Стоимость самого замера в рублях."""
-        return (self.prompt_tokens / 1_000_000 * config.PRICE_INPUT_PER_1M
-                + self.completion_tokens / 1_000_000 * config.PRICE_OUTPUT_PER_1M)
+def read_txt(path: Path) -> list[tuple[int, str]]:
+    """Возвращает [(номер страницы, текст)]. У TXT страниц нет, поэтому страница 0."""
+    return [(0, path.read_text(encoding="utf-8", errors="ignore"))]
 
 
-def save_baseline(measurement: Measurement) -> None:
-    """Сохранить замер «до» на диск. Готово, менять не нужно."""
-    config.DATA_DIR.mkdir(parents=True, exist_ok=True)
-    BASELINE.write_text(json.dumps(asdict(measurement), ensure_ascii=False, indent=2),
-                        encoding="utf-8")
+def read_pdf(path: Path) -> list[tuple[int, str]]:
+    """Возвращает [(номер страницы, текст)] — постранично, чтобы метаданное page было честным."""
+    from pypdf import PdfReader
+
+    reader = PdfReader(str(path))
+    return [(i + 1, page.extract_text() or "") for i, page in enumerate(reader.pages)]
 
 
-def load_baseline() -> Measurement | None:
-    """Прочитать замер «до», если он был сделан раньше. Готово, менять не нужно."""
-    if not BASELINE.exists():
-        return None
-    return Measurement(**json.loads(BASELINE.read_text(encoding="utf-8")))
+READERS = {".txt": read_txt, ".md": read_txt, ".pdf": read_pdf}
 
 
-def measure_dialog(label: str, questions: list[str] | None = None) -> Measurement:
-    """Прогнать эталонный диалог и снять расход токенов. Готово, менять не нужно."""
-    questions = questions or REFERENCE_DIALOG
-    orchestrator = Orchestrator()
-    session_id = f"finops:{label}"
+# --- Ваша часть (П2) ---
+def clean_text(text: str) -> str:
+    import re
 
-    try:
-        for question in questions:
-            orchestrator.handle(session_id, question)
-        usage = orchestrator.usage
-        return Measurement(
-            label=label,
-            turns=len(usage),
-            prompt_tokens=sum(u["prompt_tokens"] for u in usage),
-            completion_tokens=sum(u["completion_tokens"] for u in usage),
-        )
-    finally:
-        orchestrator.reset(session_id)
-        orchestrator.close()
+    if not text:
+        return ""
+        # 1. Склеить слова, разорванные переносом
+    text = re.sub(r"-\n", "", text)
+    # 2. Убрать строки-номера страниц (только цифры на строке)
+    text = re.sub(r"(?m)^\s*\d+\s*$", " ", text)
+    # 3. Убрать типовые колонтитулы
+    text = re.sub(r"(?im)^\s*(стр\.?|page)\s*\d+(\s*(из|of)\s*\d+)?\s*$", " ", text)
+    # 4. Схлопнуть пробелы и переводы строк
+    text = re.sub(r"\s+", " ", text)
+
+    return text.strip()
 
 
-def estimate_tco(measurement: Measurement, dialogs_per_day: int,
-                 turns_per_dialog: int) -> dict:
-    """Стоимость владения на сценарий нагрузки, заданный преподавателем.
+def chunk_text(text: str, size: int = config.CHUNK_SIZE,
+               overlap: int = config.CHUNK_OVERLAP) -> list[str]:
 
-    Верните словарь с ключами: "per_dialog", "per_day", "per_month", "per_year".
+    if overlap >= size:
+        raise ValueError("overlap должен быть меньше size")
+    if not text:
+        return []
 
-    Ход рассуждения: из замера известна стоимость turns реплик. Приведите её к
-    одной реплике, умножьте на turns_per_dialog, потом на dialogs_per_day, потом
-    на 30 и на 365.
+    chunks = []
+    step = size - overlap
+    for start in range(0, len(text), step):
+        chunk = text[start:start + size].strip()
+        if chunk:
+            chunks.append(chunk)
+        if start + size >= len(text):
+            break
 
-    Две ловушки. Первая: расход на реплику не постоянен — с ростом истории диалога
-    вход растёт, поэтому средняя по замеру занижает длинные диалоги. Отметьте это
-    как допущение. Вторая: считайте вход и выход раздельно до самого конца, их
-    цены отличаются в разы, и усреднение искажает результат.
+    return chunks
+
+
+RUBRICS: dict[str, list[str]] = {
+    "restrictions": [
+        "запрещ", "запрет", "не допуска", "недопустим", "нельзя",
+        "не разрешается", "воспреща", "ограничен", "ограничени",
+        "исключен", "исключа", "санкц", "блокир",
+        "не подлежат", "не может быть", "не должны"],
+
+    "permits": [
+        "разреш", "разрешительн", "согласован", "согласовани",
+        "лиценз", "сертификат", "допуск", "аккредит",
+        "паспорт", "заключени", "утвержд", "заявлени",
+        "ходатайств", "орган местного самоуправления",
+        "уполномоченн"],
+
+    "dimensions": [
+        "размер", "габарит", "длина", "ширина", "высота", "толщин",
+        "диаметр", "мм", "см", "метр", "площад", "объём", "объем",
+        "масса", "вес", "сечен", "радиус"],
+
+    "placement": [
+        "размещ", "размест", "разместить", "располож",
+        "монтаж", "позиц", "поставить", "местополож", "коорд",
+        "располож", "схема размещения"]
+}
+
+DEFAULT_CATEGORY = "general"
+
+
+def detect_category(text: str, source: str) -> str:
+    """Определить рубрику чанка по ключевым словам из RUBRICS.
+
+    Имя файла учитываем как подсказку: если в названии есть слово из рубрики —
+    оно весит больше, чем совпадение в тексте.
     """
-    raise NotImplementedError("П8: реализуйте расчёт TCO")
+    low_src = source.lower()
+    low_txt = text.lower()
+
+    # 1. Приоритет — имя файла (обычно самое надёжное)
+    for cat, keys in RUBRICS.items():
+        if any(k in low_src for k in keys):
+            return cat
+
+    # 2. Иначе — по тексту чанка, первый матч сверху вниз
+    for cat, keys in RUBRICS.items():
+        if any(k in low_txt for k in keys):
+            return cat
+
+    # 3. Ничего не нашли — general
+    return DEFAULT_CATEGORY
 
 
-def compare(before: Measurement, after: Measurement,
-            dialogs_per_day: int, turns_per_dialog: int) -> None:
-    """Печать отчёта до/после. Готово, менять не нужно."""
-    tco_before = estimate_tco(before, dialogs_per_day, turns_per_dialog)
-    tco_after = estimate_tco(after, dialogs_per_day, turns_per_dialog)
+# --- Сборка индекса: готова ---
 
-    def delta(old: float, new: float) -> str:
-        if not old:
-            return "—"
-        return f"{(new - old) / old * 100:+.1f}%"
+def ingest() -> int:
+    """Обходит исходные данные, нарезает и складывает в ChromaDB. Возвращает число чанков.
 
-    print(f"\nСценарий: {dialogs_per_day} диалогов в сутки по {turns_per_dialog} реплик")
-    print(f"Тарифы: вход {config.PRICE_INPUT_PER_1M} ₽ / 1М, "
-          f"выход {config.PRICE_OUTPUT_PER_1M} ₽ / 1М")
-    if not (config.PRICE_INPUT_PER_1M or config.PRICE_OUTPUT_PER_1M):
-        print("ВНИМАНИЕ: тарифы в config.py нулевые — стоимость посчитается как ноль (П8).")
+    Индекс собирается заново с нуля: коллекция очищается перед наполнением.
+    Иначе после смены CHUNK_SIZE в коллекции остались бы чанки предыдущей
+    нарезки, и hit-rate@5 замерялся бы по смеси двух — молча, без ошибки.
+    """
+    collection = config.reset_collection()
+    total = 0
 
-    print(f"\n{'':<22}{before.label:>16}{after.label:>16}{'изменение':>14}")
-    rows = [
-        ("токенов на вход", before.prompt_tokens, after.prompt_tokens),
-        ("токенов на выход", before.completion_tokens, after.completion_tokens),
-        ("токенов всего", before.total_tokens, after.total_tokens),
-    ]
-    for name, old, new in rows:
-        print(f"{name:<22}{old:>16,}{new:>16,}{delta(old, new):>14}")
+    # README.md отсеивается намеренно: это шаблонная заглушка каталога,
+    # а не документ предметной области. Без отсева она попадает в индекс
+    # и выдаётся поиском как знание.
+    files = [p for p in config.RAW_DIR.rglob("*")
+             if p.suffix.lower() in READERS and p.name != "README.md"]
+    if not files:
+        raise SystemExit(f"В {config.RAW_DIR} нет файлов .txt/.md/.pdf — положите исходные данные (П2).")
 
-    for key, title in [("per_day", "рублей в сутки"), ("per_month", "рублей в месяц"),
-                       ("per_year", "рублей в год")]:
-        old, new = tco_before[key], tco_after[key]
-        print(f"{title:<22}{old:>16,.2f}{new:>16,.2f}{delta(old, new):>14}")
+    for path in files:
+        for page, raw in READERS[path.suffix.lower()](path):
+            cleaned = clean_text(raw)
+            if not cleaned:
+                continue
+
+            for chunk in chunk_text(cleaned):
+                # id детерминированный: одинаковый текст даёт один и тот же чанк,
+                # поэтому дубли не возникают даже внутри одного прогона
+                chunk_id = hashlib.sha1(
+                    f"{path.name}:{page}:{chunk}".encode("utf-8")
+                ).hexdigest()
+
+                collection.upsert(
+                    ids=[chunk_id],
+                    documents=[chunk],
+                    metadatas=[{
+                        "source": path.name,
+                        "page": page,
+                        "category": detect_category(chunk, path.name),
+                    }],
+                )
+                total += 1
+
+    return total
+
+
+# --- Замер качества поиска: готов ---
+
+def evaluate_retrieval(k: int = config.TOP_K) -> float:
+    """hit-rate@k по черновику Gold Dataset. Готово, менять не нужно.
+
+    Для каждого вопроса выполняется поиск и проверяется, попал ли в первые k
+    результатов хотя бы один чанк из ожидаемых источников.
+
+    Вопросы с пустым expected_sources пропускаются: это проверка отказа отвечать,
+    а она требует LLM и меряется на П6, а не здесь.
+
+    Обращается к коллекции напрямую, а не через MCP: на П2 оркестратора ещё нет.
+    """
+    import json
+
+    dataset_path = Path(__file__).parent / "gold_dataset.json"
+    cases = [c for c in json.loads(dataset_path.read_text(encoding="utf-8"))
+             if c.get("expected_sources")]
+
+    if not cases:
+        print("В gold_dataset.json нет вопросов с expected_sources — замерять нечего (П2).")
+        return 0.0
+
+    collection = config.get_collection()
+    hits = 0
+
+    print(f"\nhit-rate@{k}  |  чанк {config.CHUNK_SIZE}, overlap {config.CHUNK_OVERLAP}")
+    for case in cases:
+        result = collection.query(query_texts=[case["question"]], n_results=k)
+        found = {(m or {}).get("source", "") for m in (result.get("metadatas") or [[]])[0]}
+        hit = bool(found & set(case["expected_sources"]))
+        hits += hit
+        print(f"  [{'+' if hit else '-'}] {case['question'][:70]}")
+        if not hit:
+            print(f"      ожидалось: {case['expected_sources']}, найдено: {sorted(found)}")
+
+    rate = hits / len(cases)
+    print(f"\nhit-rate@{k} = {rate:.0%}  ({hits} из {len(cases)})")
+    skipped = len(json.loads(dataset_path.read_text(encoding="utf-8"))) - len(cases)
+    if skipped:
+        print(f"Пропущено вопросов без expected_sources: {skipped} — они меряются на П6.")
+    return rate
 
 
 if __name__ == "__main__":
-    # TODO (П8): подставьте сценарий, который задал преподаватель
-    DIALOGS_PER_DAY = 500
-    TURNS_PER_DIALOG = 8
+    import sys
 
-    if "--reset" in sys.argv:
-        BASELINE.unlink(missing_ok=True)
-        print("Замер «до» сброшен. Следующий прогон снимет его заново.")
-        raise SystemExit(0)
+    if "--eval" not in sys.argv:
+        count = ingest()
+        print(f"Индекс пересобран заново. Проиндексировано чанков: {count}")
+        print(f"Всего в коллекции: {config.get_collection().count()}")
 
-    baseline = load_baseline()
-
-    if baseline is None:
-        baseline = measure_dialog("до")
-        save_baseline(baseline)
-        print(f"Замер «до»: {baseline.turns} реплик, "
-              f"{baseline.prompt_tokens:,} на вход, {baseline.completion_tokens:,} на выход")
-        print(f"Сохранён в {BASELINE.name}.")
-        print("Проведите одну оптимизацию и запустите finops.py снова — "
-              "он снимет замер «после» и напечатает сравнение.")
-    else:
-        after = measure_dialog("после")
-        compare(baseline, after, DIALOGS_PER_DAY, TURNS_PER_DIALOG)
-        print("\nЧтобы начать замеры заново: python finops.py --reset")
+    evaluate_retrieval()
