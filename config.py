@@ -28,8 +28,8 @@ SECURITY_LOG = BASE_DIR / "security_logs.txt"
 COLLECTION_NAME = "knowledge_base"
 EMBEDDING_MODEL = "intfloat/multilingual-e5-small"
 CHUNK_SIZE = 512      # символов в чанке
-CHUNK_OVERLAP = 64    # перекрытие между соседними чанками
-TOP_K = 5             # сколько чанков возвращает поиск
+CHUNK_OVERLAP = 64   # перекрытие между соседними чанками
+TOP_K = 3             # сколько чанков возвращает поиск
 
 # --- Параметры памяти (подбираются на П5) ---
 MEMORY_WINDOW = 10    # сколько последних сообщений уходит в контекст LLM
